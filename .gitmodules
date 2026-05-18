@@ -1,0 +1,3 @@
+[submodule "vendor/enex2notion"]
+	path = vendor/enex2notion
+	url = https://github.com/subimage/enex2notion

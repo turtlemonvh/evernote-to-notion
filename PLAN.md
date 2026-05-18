@@ -160,40 +160,171 @@ Walks every `.enex` file in `data/enex/`, parses the XML, and for each note extr
 
 ---
 
+## Phase 1.5: Pre-Import Attachment Optimization
+
+**Goal:** Process the ENEX files to fit Notion's free-plan 5 MB per-attachment limit
+*before* import, by downscaling oversized images and offloading non-image (or
+still-too-large) attachments to Dropbox with link replacement. Designed and run
+only after Phase 1 inventory reveals the actual scope.
+
+### Script
+
+`phase1_5_attachments/optimize_attachments.py`
+
+### Inputs / Outputs
+
+- **Input:** `data/enex/` (canonical archive — never modified)
+- **Output:** `data/enex_processed/` (used for Phase 2 import)
+- **Staging:** `data/large_attachments/` (files pending Dropbox upload)
+- **Log:** `data/reports/attachment_actions.csv`
+
+### Image downscaling
+
+For each `<resource>` with `mime` starting `image/` and base64-decoded size > 5 MB:
+
+1. Decode base64 from `<resource><data>`
+2. Use Pillow to resize (initial: max edge 2048 px, JPEG quality 85)
+3. If still over 5 MB, iterate down (1600 px, 1280 px, quality 75 / 65)
+4. Re-encode to base64, replace `<data>` content
+5. Recompute MD5 hash of the new binary; update every inline `<en-media hash="...">`
+   reference in the note body that pointed to the old hash
+
+### Large non-image / unshrinkable-image offload
+
+For each remaining oversized resource:
+
+1. Write the binary to `data/large_attachments/<note_guid>/<original_filename>`
+2. Upload to Dropbox (mechanism TBD — see "Open Questions" below)
+3. Replace inline `<en-media hash="...">` with `<a href="<dropbox_url>"><filename></a>`
+4. Remove the `<resource>` block from the note's ENEX entry
+
+### Critical safety rules
+
+- `data/enex/` is never modified — all changes go to `data/enex_processed/`
+- Every action logged to CSV with: note title, note GUID, resource filename, MIME,
+  original bytes, action (downscale/offload/kept), new bytes, new hash, Dropbox URL
+- Resource hash linkage must stay consistent — if hash changes, every inline reference
+  must update or the image breaks on import
+
+### Manual audit step
+
+After downscaling, every modified image is logged to `data/reports/audit_targets.csv`
+with a `priority_review` flag set when:
+- Aspect ratio > 2.0 (long screenshot — text legibility risk), OR
+- Original was PNG (often text-heavy diagrams or UI screenshots)
+
+User opens the priority targets in Notion (or the processed ENEX) and visually
+confirms the downscaled images are still legible. If any fail audit, re-run the
+optimizer for that specific note with a higher quality / lower max-edge cap.
+
+### Decisions made (post-inventory)
+
+- Threshold: 4.5 MB (leaves safety margin under Notion's 5 MB hard cap)
+- Dropbox link minting: manual — 5 files only (3 audio + 2 PDFs); user uploads
+  and pastes share URLs into `data/large_attachments/dropbox_links.json`
+- HEIC dependency: `pillow-heif` installed in the conda env; HEIC images
+  transcode to JPEG during downscale
+- Image downscale ladder: max edge 2048 px, quality 85→75→65→55, then progressive
+  edge reduction if still over target. Output as JPEG except PNGs with transparency.
+
+---
+
 ## Phase 2: Import to Notion
 
-**Goal:** Get content into Notion using the built-in importer. Accept that internal links
-will be broken at this stage — that is expected and will be fixed in Phase 4.
+**Goal:** Upload the processed ENEX files (`data/enex_processed/`) into Notion,
+preserving structure and embedded resources. Accept that internal links will be
+broken at this stage — that is expected and will be fixed in Phase 4.
+
+### Why not Notion's native Evernote importer?
+
+Notion's built-in Evernote import is **OAuth-only** and pulls live from your
+Evernote account — it does not accept ENEX file uploads. That bypasses all of
+Phase 1.5's attachment optimization and silently drops anything over 5 MB.
+
+### Tool
+
+[`subimage/enex2notion`](https://github.com/subimage/enex2notion) — a fork of
+the original `vzhd1701/enex2notion` that uses official Notion **integration
+tokens** (not the deprecated `token_v2` cookie) and has been updated for current
+Notion API. Vendored as a git submodule at `vendor/enex2notion/` so we can patch
+it as needed without losing track of upstream.
 
 ### Steps
 
-1. Open Notion → Settings → Import → Evernote
-2. Authenticate with your Evernote account
-3. Import **one notebook at a time**, in batches — do not try to import everything at once
-4. After each notebook, wait for import to complete before starting the next
-5. If an import appears stuck for more than 3 hours with no new notes appearing, cancel
-   and re-import that notebook in smaller note-count chunks
+1. Submodule already initialized: `vendor/enex2notion`
+2. Install in editable mode:
+   ```bash
+   ./scripts/conda-run.sh pip install -e vendor/enex2notion
+   ```
+3. Create a Notion integration at https://www.notion.so/my-integrations.
+   Capabilities: Read/Update/Insert content. Copy the `secret_...` token to `.env`
+   as `NOTION_TOKEN`.
+4. Create a destination page in Notion (e.g. "Evernote Archive"). On that page:
+   `…` menu → Connections → add the integration. Copy the page ID from the URL
+   to `.env` as `NOTION_ROOT_PAGE_ID`.
+5. **Spike:** dry-run + small real upload on `data/enex_processed/Skitch.enex`
+   (2 notes) to verify the toolchain end to end:
+   ```bash
+   ./scripts/conda-run.sh enex2notion --verbose data/enex_processed/Skitch.enex
+   ./scripts/conda-run.sh enex2notion --token "$NOTION_TOKEN" \
+       --pageid "$NOTION_ROOT_PAGE_ID" \
+       --done-file data/reports/notion_import.done \
+       data/enex_processed/Skitch.enex
+   ```
+6. Inspect the result in Notion. If broken, patch in `vendor/enex2notion/` (the
+   editable install picks up changes immediately) and commit the patch to this
+   repo's history.
+7. Once the spike is clean, import in waves — small/medium notebooks first to
+   surface bugs cheaply; biggest last (Ionic 320, Featurespace 227, Carley and
+   Timothy 173).
+
+### Idempotence and recovery
+
+`enex2notion` is **not "overwrite on re-run"**. It uses `--done-file` to skip
+notes whose content hash is already recorded as imported.
+
+To re-import a single note (e.g. one that imported badly):
+
+1. Delete the bad page in Notion.
+2. Remove that note's hash line from `data/reports/notion_import.done`.
+3. Re-run with the same ENEX file — it will skip everything else and re-upload
+   just that note.
+
+Failed notes get a `[UNFINISHED UPLOAD]` title marker; by default the tool
+deletes them on failure. Pass `--keep-failed` to retain the partial page in
+Notion for inspection.
+
+### Auth caveats
+
+The integration token doesn't expire (unlike `token_v2` cookies), but the
+integration must be explicitly **connected** to each top-level page it needs to
+write under. The script writes new notebooks as children of `NOTION_ROOT_PAGE_ID`,
+which inherits the connection.
 
 ### What imports correctly
 
 - Note text and basic formatting
-- Tags (become Notion page properties)
-- Created/modified dates (may need a Date property added manually)
-- Notebooks become pages; notes become database items within those pages
+- Tags (become Notion database properties in `DB` mode; metadata callout in `PAGE` mode)
+- Created/modified dates as database properties
+- Embedded images and attachments under 5 MB
+- The `<a href="dropbox URL">filename</a>` markers Phase 1.5 inserted for
+  oversized files — these become plain clickable links
 
 ### What does NOT import correctly
 
-- **Internal note links** — will be dead `evernote:///` links (fixed in Phase 4)
-- **Images** may not render and may need cleanup
+- **Internal note links** — `evernote:///` URIs are dead links (fixed in Phase 4)
 - **Encrypted note sections** — not supported, will be blank
 - **Note history** — not preserved
+- **Some web clip styling** — Evernote web clips are converted to plain text by
+  default (`--mode-webclips=TXT`)
 
 ### Notes on the free plan file limit
 
-Notes with attachments over 5MB will fail silently or import without the attachment.
-The Phase 1 inventory flags these. For affected notes, options are:
-- Upload the Evernote attachment to Google Drive and paste the share link into the note
-- Upgrade to Notion Plus ($10/month) during migration, then decide whether to stay paid
+Notes with attachments over 5 MB are handled by **Phase 1.5** preprocessing:
+oversized images are downscaled in-place; non-image / unshrinkable attachments
+are offloaded to Dropbox and replaced with link references. The version of the
+ENEX library that Phase 2 imports (`data/enex_processed/`) is already
+within-limit on every resource.
 
 ---
 

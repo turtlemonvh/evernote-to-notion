@@ -1,0 +1,18 @@
+.env
+data/enex/
+data/enex_processed/
+data/large_attachments/
+data/reports/
+en_backup.db
+en_backup.db-journal
+__pycache__/
+*.pyc
+.venv/
+
+# Ad-hoc command logs created by the user during interactive runs.
+dropbox-backup.log
+evernote-backup.log
+
+# Editor swap / temp files
+*.swp
+*.swo
