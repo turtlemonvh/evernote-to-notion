@@ -21,6 +21,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from notion_client import Client
 
+from enex2notion.cli_notion import install_throttle
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / '.env')
 
@@ -52,7 +54,7 @@ def main() -> int:
         print('NOTION_TOKEN and NOTION_ROOT_PAGE_ID must be set in .env')
         return 1
 
-    client = Client(auth=token, timeout_ms=60000)
+    client = install_throttle(Client(auth=token, timeout_ms=60000))
 
     children = retry(client.blocks.children.list, block_id=root_page)
     databases = [b for b in children['results'] if b['type'] == 'child_database']
