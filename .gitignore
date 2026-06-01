@@ -1,6 +1,7 @@
 .env
 data/enex/
 data/enex_processed/
+data/enex_processed.pre_repair.bak/
 data/large_attachments/
 data/reports/
 en_backup.db
